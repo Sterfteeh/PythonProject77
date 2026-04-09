@@ -1,0 +1,8 @@
+.idea/
+.cache/
+outputs/
+outputs_yahoo/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
