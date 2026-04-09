@@ -15,6 +15,7 @@ def save_backtest_outputs(result: BacktestResult, output_dir: str | Path) -> dic
     files = {
         "daily_results": target_dir / "daily_results.csv",
         "rebalance_weights": target_dir / "rebalance_weights.csv",
+        "desired_daily_weights": target_dir / "desired_daily_weights.csv",
         "daily_weights": target_dir / "daily_weights.csv",
         "metrics": target_dir / "metrics.json",
         "equity_curve": target_dir / "equity_curve.png",
@@ -22,6 +23,7 @@ def save_backtest_outputs(result: BacktestResult, output_dir: str | Path) -> dic
 
     result.daily_results.to_csv(files["daily_results"], index_label="date")
     result.target_weights.to_csv(files["rebalance_weights"], index_label="date")
+    result.desired_daily_weights.to_csv(files["desired_daily_weights"], index_label="date")
     result.daily_weights.to_csv(files["daily_weights"], index_label="date")
     files["metrics"].write_text(json.dumps(result.metrics, indent=2), encoding="utf-8")
 
@@ -40,6 +42,8 @@ def format_metrics(metrics: dict[str, float]) -> str:
         "win_rate",
         "average_daily_turnover",
         "average_gross_exposure",
+        "average_blocked_turnover",
+        "execution_fill_rate",
     ]
     lines = []
     for key in ordered_keys:

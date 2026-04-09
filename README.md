@@ -1,62 +1,116 @@
-# Cross-Sectional Long-Short Trading System
+# Cross-Sectional Trading System
 
-This project implements a research-oriented cross-sectional long-short system in Python.
+This repository contains a research-oriented cross-sectional trading system in Python.
 
-It is designed to be simple enough to understand end-to-end, but structured enough to extend into a real research workflow.
+It supports:
 
-## What the system does
+- synthetic demo data
+- local CSV files
+- real US market data from Yahoo
+- real A-share market data from Tushare
 
-1. Load a daily close-price matrix from CSV, generate a synthetic demo dataset, or download real data from Yahoo / Tushare.
-2. Compute a cross-sectional momentum factor:
-   - signal date `t`
-   - momentum = `price[t - skip_recent_days] / price[t - lookback_days - skip_recent_days] - 1`
-3. Rebalance on a fixed schedule such as monthly or weekly.
-4. Rank assets by the factor on each rebalance date.
-5. Go long the strongest bucket and short the weakest bucket.
-6. Keep the portfolio dollar-neutral:
-   - long book = `+0.5`
-   - short book = `-0.5`
-   - gross exposure = `1.0`
-7. Shift positions by one trading day to avoid look-ahead bias.
-8. Deduct transaction costs based on turnover.
-9. Output equity curve, weights, daily returns, and summary metrics.
+## What is implemented
+
+The strategy is a cross-sectional momentum model:
+
+1. compute each asset's momentum signal with a lookback window and a recent-days skip window
+2. rank assets on each rebalance date
+3. build either:
+   - a `long_short` portfolio: long the strongest bucket and short the weakest bucket
+   - a `long_only` portfolio: hold only the strongest bucket
+4. shift signals by one trading day to avoid look-ahead bias
+5. simulate daily execution and deduct transaction costs
+
+For A-shares, the system also supports more realistic execution constraints:
+
+- suspended or zero-liquidity days block trading
+- stocks opening at the daily upper limit block buy orders
+- stocks opening at the daily lower limit block sell orders
+- blocked orders keep the old position instead of forcing the target weight
 
 ## Project structure
 
-- `cross_sectional_ls/data.py`: price loading and demo data generation.
-- `cross_sectional_ls/market_data.py`: Yahoo / Tushare real-market downloaders and universe builders.
-- `cross_sectional_ls/system.py`: factor, ranking, weighting, and backtest engine.
-- `cross_sectional_ls/metrics.py`: performance statistics.
-- `cross_sectional_ls/reporting.py`: CSV / JSON / PNG output.
-- `main.py`: command-line entry point.
-- `tests/test_system.py`: smoke tests.
+- `cross_sectional_ls/data.py`: local CSV loading and synthetic data generation
+- `cross_sectional_ls/market_data.py`: Yahoo and Tushare data downloaders, A-share universe selection, tradeability masks
+- `cross_sectional_ls/system.py`: factor calculation, portfolio construction, execution simulation, and backtest engine
+- `cross_sectional_ls/metrics.py`: performance statistics
+- `cross_sectional_ls/reporting.py`: CSV, JSON, and PNG outputs
+- `main.py`: command-line entry point
+- `tests/test_system.py`: unit tests
 
-## How to run
+## Installation
 
-Run the demo system:
+Create and activate a virtual environment:
 
-```bash
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+Install dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+## Quick start
+
+Run the demo:
+
+```powershell
 python main.py
 ```
 
-Run with your own CSV:
+Run with a local CSV:
 
-```bash
-python main.py --data-source csv --prices path/to/prices.csv
+```powershell
+python main.py --data-source csv --prices path\to\prices.csv
 ```
 
-Run with real US market data from Yahoo:
+Run with Yahoo data:
 
-```bash
-python main.py --data-source yahoo --universe-preset us-sector-etfs --start-date 2021-01-01 --end-date 2025-12-31
+```powershell
+python main.py --data-source yahoo --universe-preset dow30 --start-date 2021-01-01 --end-date 2025-12-31
 ```
 
-Run with real A-share data from Tushare:
+Run with A-share data from Tushare:
 
-```bash
+```powershell
 set TUSHARE_TOKEN=your_token_here
-python main.py --data-source tushare --start-date 2021-01-01 --end-date 2025-12-31 --tushare-universe-size 200 --tushare-markets 主板,创业板
+python main.py --data-source tushare --start-date 2021-01-01 --end-date 2025-12-31 --tushare-universe-size 200 --tushare-markets main,gem
 ```
+
+## Important CLI options
+
+- `--data-source demo|csv|yahoo|tushare`
+- `--portfolio-mode auto|long_short|long_only`
+- `--start-date YYYY-MM-DD`
+- `--end-date YYYY-MM-DD`
+- `--symbols AAPL,MSFT,...`
+- `--symbols-file path\to\symbols.txt`
+- `--universe-preset us-sector-etfs|dow30`
+- `--lookback`
+- `--skip-recent`
+- `--rebalance-frequency`
+- `--long-quantile`
+- `--short-quantile`
+- `--gross-leverage`
+- `--min-assets`
+- `--transaction-cost-bps`
+- `--cache-dir`
+- `--refresh-cache`
+- `--disable-trade-constraints`
+
+## A-share workflow
+
+When `--data-source tushare` is used:
+
+- if you do not pass `--symbols` or `--symbols-file`, the system builds an automatic universe
+- the automatic universe keeps listed stocks only
+- ST stocks are excluded by default
+- the universe applies a minimum listing-age filter
+- the universe sorts by the latest daily turnover amount and keeps the top `N`
+- `portfolio_mode=auto` becomes `long_only`, which is the more realistic default for A-shares
 
 ## Supported CSV formats
 
@@ -78,59 +132,42 @@ date,asset,close
 2024-01-02,B,19.8
 ```
 
-## Key assumptions
+## Outputs
 
-- Prices are daily close prices.
-- Signals are computed at the close of the rebalance day.
-- Execution starts on the next trading day.
-- Missing asset returns are treated as zero after weights are formed.
-- Shorting, financing, borrow costs, and slippage are not modeled separately.
-- Transaction cost is modeled as:
+Each run writes files under the selected output directory:
 
-```text
-turnover * cost_bps / 10000
+- `daily_results.csv`
+- `rebalance_weights.csv`
+- `desired_daily_weights.csv`
+- `daily_weights.csv`
+- `metrics.json`
+- `equity_curve.png`
+- `used_prices.csv`
+- `run_metadata.json`
+
+## Notes on realism
+
+This is still a research backtest, not a full production execution engine.
+
+What is modeled:
+
+- one-day signal lag
+- transaction costs
+- A-share open-limit trading blocks
+- A-share zero-liquidity / suspension-style blocks
+
+What is not fully modeled:
+
+- borrow fees and financing costs
+- exact intraday fill probability at price limits
+- dynamic shortable lists for A-shares
+- delisting and corporate-action edge cases beyond return-based price reconstruction
+- sector-neutral or market-cap-neutral optimization
+
+## Testing
+
+Run unit tests:
+
+```powershell
+python -m unittest discover -s tests -v
 ```
-
-## Useful parameters
-
-- `--data-source`
-- `--start-date`
-- `--end-date`
-- `--symbols`
-- `--symbols-file`
-- `--universe-preset`
-- `--cache-dir`
-- `--refresh-cache`
-- `--lookback`
-- `--skip-recent`
-- `--rebalance-frequency`
-- `--long-quantile`
-- `--short-quantile`
-- `--min-assets`
-- `--transaction-cost-bps`
-
-## Real-market notes
-
-- Yahoo mode uses the public chart API and prefers adjusted close when available.
-- Tushare mode uses `stock_basic`, `trade_cal`, and `daily`.
-- For A-shares, the code rebuilds an adjusted-price-like series from `pct_chg`, which already reflects ex-right / ex-dividend handling in Tushare daily data.
-- The automatic A-share universe:
-  - keeps listed stocks only
-  - excludes ST by default
-  - applies a minimum listing age filter
-  - ranks by latest daily turnover amount and keeps the top `N`
-- All downloaded price matrices are cached under `.cache/`.
-
-## Output files
-
-- `used_prices.csv`: the actual matrix fed into the strategy.
-- `run_metadata.json`: data source, symbols, and strategy parameters.
-
-## Extension ideas
-
-- Replace momentum with value, quality, residual reversal, or blended factors.
-- Add sector / industry neutrality constraints.
-- Add volatility scaling or risk-parity weighting.
-- Load adjusted prices and delisting-aware universes.
-- Add benchmark comparison and factor attribution.
-- Replace synthetic data with Wind / Tushare / JoinQuant exports.

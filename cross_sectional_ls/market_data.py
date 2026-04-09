@@ -66,6 +66,8 @@ class MarketDataBundle:
     prices: pd.DataFrame
     description: str
     metadata: dict[str, Any]
+    buy_blocked: pd.DataFrame | None = None
+    sell_blocked: pd.DataFrame | None = None
 
 
 class TushareHttpClient:
@@ -277,6 +279,73 @@ def build_tushare_ashare_universe(
     return universe
 
 
+def download_tushare_bundle(
+    token: str,
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    cache_dir: str | Path = ".cache",
+    refresh_cache: bool = False,
+    include_trade_constraints: bool = True,
+) -> MarketDataBundle:
+    if not tickers:
+        raise ValueError("At least one Tushare symbol is required.")
+
+    trading_dates = get_tushare_trade_dates(token, start_date, end_date)
+    if trading_dates.empty:
+        raise RuntimeError(
+            f"No Tushare trade dates returned between {start_date} and {end_date}."
+        )
+
+    daily_data = download_tushare_daily_frame(
+        token=token,
+        tickers=tickers,
+        start_date=start_date,
+        end_date=end_date,
+        cache_dir=cache_dir,
+        refresh_cache=refresh_cache,
+    )
+    prices = _build_adjusted_prices_from_tushare_returns(
+        daily_data=daily_data,
+        trading_dates=trading_dates,
+    )
+    prices.index.name = "date"
+
+    buy_blocked = None
+    sell_blocked = None
+    metadata: dict[str, Any] = {
+        "symbol_count": len(tickers),
+        "trading_day_count": len(trading_dates),
+    }
+
+    if include_trade_constraints:
+        limit_data = download_tushare_limit_frame(
+            token=token,
+            tickers=tickers,
+            start_date=start_date,
+            end_date=end_date,
+            cache_dir=cache_dir,
+            refresh_cache=refresh_cache,
+        )
+        buy_blocked, sell_blocked, constraint_metadata = build_tushare_tradeability_masks(
+            daily_data=daily_data,
+            limit_data=limit_data,
+            trading_dates=trading_dates,
+        )
+        metadata.update(constraint_metadata)
+
+    return MarketDataBundle(
+        prices=prices,
+        description=(
+            f"downloaded from Tushare daily API for {len(tickers)} A-share symbols "
+            f"between {start_date} and {end_date}"
+        ),
+        metadata=metadata,
+        buy_blocked=buy_blocked,
+        sell_blocked=sell_blocked,
+    )
+
+
 def download_tushare_prices(
     token: str,
     tickers: list[str],
@@ -285,12 +354,28 @@ def download_tushare_prices(
     cache_dir: str | Path = ".cache",
     refresh_cache: bool = False,
 ) -> pd.DataFrame:
-    if not tickers:
-        raise ValueError("At least one Tushare symbol is required.")
+    return download_tushare_bundle(
+        token=token,
+        tickers=tickers,
+        start_date=start_date,
+        end_date=end_date,
+        cache_dir=cache_dir,
+        refresh_cache=refresh_cache,
+        include_trade_constraints=False,
+    ).prices
 
+
+def download_tushare_daily_frame(
+    token: str,
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    cache_dir: str | Path = ".cache",
+    refresh_cache: bool = False,
+) -> pd.DataFrame:
     cache_path = _cache_path(
         cache_dir,
-        "tushare_prices",
+        "tushare_daily_frame",
         {
             "tickers": tickers,
             "start_date": start_date,
@@ -298,17 +383,15 @@ def download_tushare_prices(
         },
     )
     if cache_path.exists() and not refresh_cache:
-        return pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        cached = pd.read_csv(cache_path)
+        cached["trade_date"] = pd.to_datetime(cached["trade_date"])
+        return cached
 
     client = TushareHttpClient(token)
     trading_dates = get_tushare_trade_dates(token, start_date, end_date)
-    if trading_dates.empty:
-        raise RuntimeError(
-            f"No Tushare trade dates returned between {start_date} and {end_date}."
-        )
-
     batch_size = max(1, 5500 // max(1, len(trading_dates)))
     daily_frames: list[pd.DataFrame] = []
+
     for batch in _batched(tickers, batch_size):
         daily = client.query(
             "daily",
@@ -317,7 +400,7 @@ def download_tushare_prices(
                 "start_date": _compact_date(start_date),
                 "end_date": _compact_date(end_date),
             },
-            fields="ts_code,trade_date,close,pct_chg",
+            fields="ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount",
         )
         if not daily.empty:
             daily_frames.append(daily)
@@ -328,14 +411,82 @@ def download_tushare_prices(
     daily_data = pd.concat(daily_frames, ignore_index=True)
     daily_data["trade_date"] = pd.to_datetime(daily_data["trade_date"], format="%Y%m%d")
     daily_data = daily_data.sort_values(["trade_date", "ts_code"])
+    daily_data.to_csv(cache_path, index=False)
+    return daily_data
 
-    prices = _build_adjusted_prices_from_tushare_returns(
-        daily_data=daily_data,
-        trading_dates=trading_dates,
+
+def download_tushare_limit_frame(
+    token: str,
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    cache_dir: str | Path = ".cache",
+    refresh_cache: bool = False,
+) -> pd.DataFrame:
+    cache_path = _cache_path(
+        cache_dir,
+        "tushare_stk_limit",
+        {
+            "tickers": tickers,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
     )
-    prices.index.name = "date"
-    prices.to_csv(cache_path, index=True)
-    return prices
+    if cache_path.exists() and not refresh_cache:
+        cached = pd.read_csv(cache_path)
+        cached["trade_date"] = pd.to_datetime(cached["trade_date"])
+        return cached
+
+    client = TushareHttpClient(token)
+    limit_frames: list[pd.DataFrame] = []
+    for ticker in tickers:
+        limit_frame = client.query(
+            "stk_limit",
+            params={
+                "ts_code": ticker,
+                "start_date": _compact_date(start_date),
+                "end_date": _compact_date(end_date),
+            },
+            fields="trade_date,ts_code,up_limit,down_limit",
+        )
+        if not limit_frame.empty:
+            limit_frames.append(limit_frame)
+
+    if not limit_frames:
+        raise RuntimeError("Tushare stk_limit returned no price-limit data.")
+
+    limit_data = pd.concat(limit_frames, ignore_index=True)
+    limit_data["trade_date"] = pd.to_datetime(limit_data["trade_date"], format="%Y%m%d")
+    limit_data = limit_data.sort_values(["trade_date", "ts_code"])
+    limit_data.to_csv(cache_path, index=False)
+    return limit_data
+
+
+def build_tushare_tradeability_masks(
+    daily_data: pd.DataFrame,
+    limit_data: pd.DataFrame,
+    trading_dates: pd.DatetimeIndex,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    open_matrix = _pivot_market_field(daily_data, "open", trading_dates)
+    close_matrix = _pivot_market_field(daily_data, "close", trading_dates)
+    vol_matrix = _pivot_market_field(daily_data, "vol", trading_dates)
+    amount_matrix = _pivot_market_field(daily_data, "amount", trading_dates)
+    up_limit_matrix = _pivot_market_field(limit_data, "up_limit", trading_dates)
+    down_limit_matrix = _pivot_market_field(limit_data, "down_limit", trading_dates)
+
+    suspended = (
+        close_matrix.isna()
+        | vol_matrix.fillna(0.0).le(0.0)
+        | amount_matrix.fillna(0.0).le(0.0)
+    )
+    buy_blocked = suspended | _near_price_level(open_matrix, up_limit_matrix)
+    sell_blocked = suspended | _near_price_level(open_matrix, down_limit_matrix)
+
+    metadata = {
+        "average_buy_block_ratio": float(buy_blocked.mean().mean()),
+        "average_sell_block_ratio": float(sell_blocked.mean().mean()),
+    }
+    return buy_blocked, sell_blocked, metadata
 
 
 def get_tushare_trade_dates(token: str, start_date: str, end_date: str) -> pd.DatetimeIndex:
@@ -463,6 +614,23 @@ def _build_adjusted_prices_from_tushare_returns(
         price_columns[symbol] = adjusted
 
     return pd.DataFrame(price_columns, index=trading_dates)
+
+
+def _pivot_market_field(
+    frame: pd.DataFrame,
+    field: str,
+    trading_dates: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    matrix = frame.pivot(index="trade_date", columns="ts_code", values=field)
+    return matrix.reindex(trading_dates).sort_index()
+
+
+def _near_price_level(
+    price_matrix: pd.DataFrame,
+    level_matrix: pd.DataFrame,
+    tolerance: float = 0.011,
+) -> pd.DataFrame:
+    return (price_matrix - level_matrix).abs().le(tolerance) & level_matrix.notna()
 
 
 def _batched(items: list[str], batch_size: int) -> list[list[str]]:
